@@ -1,0 +1,5 @@
+name: pynorg
+channels:
+  - defaults
+dependencies:
+  - python
