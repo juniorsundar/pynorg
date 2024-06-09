@@ -1,20 +1,17 @@
 import os
 import subprocess
-import shutil
 import json
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
+from .helpers.norg_parser import extract_metadata
 
 def find_norg_files(index_dir: str):
     norg_files = []
     for root, _, files in os.walk(index_dir):
-        # Do not touch the journal folder
-        if "journal" in root:
-            continue
         for file in files:
             if file.endswith(".norg"):
                 relative_path = os.path.relpath(os.path.join(root, file), index_dir)
-                relative_path = f":$/{relative_path[:-5]}:"
+                relative_path = f":$/{relative_path.split('.')[0]}:"
                 norg_files.append(relative_path)
     return norg_files
 
@@ -25,12 +22,14 @@ def strip_rel_addr(addr: str):
     return "/".join(addr_tuple)
 
 
-def run_ripgrep_for_text(text, search_dir):
-    text = text.split(":")[1][2:]
-    text_result = {f"{text}": []}
+def run_ripgrep_for_text(text, search_dir, return_dict):
+    text_key = text.split(":")[1][2:]
+    text_result = {f"{text_key}": {"backlinks": [], "metadata": {}}}
+    text_result[f"{text_key}"]["metadata"] = extract_metadata(f"{search_dir}/{text_key}.norg")
+
+    command = ["rg", "--json", "--fixed-strings", f":$/{text_key}:", search_dir]
+    result = subprocess.run(command, text=True, capture_output=True)
     try:
-        command = ["rg", "--json", "--fixed-strings", text, search_dir]
-        result = subprocess.run(command, text=True, capture_output=True)
         if result.returncode == 0:
             json_lines = result.stdout.splitlines()
             for json_line in json_lines:
@@ -38,77 +37,56 @@ def run_ripgrep_for_text(text, search_dir):
                     match_data = json.loads(json_line)
                     if match_data.get("type") == "match":
                         for submatch in match_data["data"]["submatches"]:
-                            line_number = match_data["data"]["line_number"]
-                            start = submatch["start"] + 1
-                            end = submatch["end"]
                             match_addr = strip_rel_addr(
                                 os.path.relpath(
                                     match_data["data"]["path"]["text"], search_dir
                                 )
                             )
-                            text_result[f"{text}"].append(
+                            text_result[f"{text_key}"]["backlinks"].append(
                                 {
                                     "match": match_addr,
-                                    "line": line_number,
-                                    "start_column": start,
-                                    "end_column": end,
+                                    "line": match_data["data"]["line_number"],
+                                    "col": submatch["start"] + 1,
                                 }
                             )
                 except json.JSONDecodeError:
                     continue
         else:
-            text_result[f"{text}"].append(
+            text_result[f"{text_key}"]["backlinks"].append(
                 {
                     "match": None,
                     "line": None,
-                    "start_column": None,
-                    "end_column": None,
-                    "error": (
-                        result.stderr.strip()
-                        if result.stderr
-                        else f"No matches for: {text}"
-                    ),
+                    "col": None,
                 }
             )
     except Exception as e:
-        text_result[f"{text}"].append(
+        text_result[f"{text_key}"]["backlinks"].append(
             {
                 "match": None,
                 "line": None,
-                "start_column": None,
-                "end_column": None,
-                "error": str(e),
+                "col": str(e),
             }
         )
 
-    return {text: text_result[f"{text}"]}
+    return_dict[text_key] = text_result[f"{text_key}"]
 
 
 def run_ripgrep(text_list, search_dir):
-    results = {}
+    manager = multiprocessing.Manager()
+    return_dict = manager.dict()
+    processes = []
 
-    with ProcessPoolExecutor() as executor:
-        futures = {
-            executor.submit(run_ripgrep_for_text, text, search_dir): text
-            for text in text_list
-        }
-        for future in as_completed(futures):
-            text = futures[future]
-            try:
-                result = future.result()
-                results.update(result)
-            except Exception as e:
-                results[text] = [
-                    {
-                        "match": None,
-                        "line": None,
-                        "start_column": None,
-                        "end_column": None,
-                        "error": str(e),
-                    }
-                ]
+    for text in text_list:
+        p = multiprocessing.Process(
+            target=run_ripgrep_for_text, args=(text, search_dir, return_dict)
+        )
+        p.start()
+        processes.append(p)
 
-    return results
+    for p in processes:
+        p.join()
+
+    return return_dict.copy()
 
 
 def check(index_dir: str):
